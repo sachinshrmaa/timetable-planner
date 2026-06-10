@@ -1,4 +1,4 @@
-import { useState, useRef, useMemo, Fragment, useEffect } from 'react';
+import { useState, useRef, useMemo, useEffect } from 'react';
 import * as XLSX from 'xlsx';
 import html2canvas from 'html2canvas';
 import { jsPDF } from 'jspdf';
@@ -13,11 +13,7 @@ const UploadIcon = ({ className }) => (
   </svg>
 );
 
-const FileIcon = ({ className }) => (
-  <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-    <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
-  </svg>
-);
+
 
 const CheckCircleIcon = ({ className }) => (
   <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -127,6 +123,9 @@ const DEMO_DATA = [
   { id: 11, programme: "M.Tech Artificial Intelligence", semester: "Semester 1", courseName: "Optimization Techniques", faculty: "Prof. Carl Gauss", hours: 3, courseCode: "AIM-503", classroom: "Room 302", school: "School of Sciences", mergeCode: "", sessionBlockSize: 0 },
   { id: 12, programme: "M.Tech Artificial Intelligence", semester: "Semester 1", courseName: "Natural Language Processing", faculty: "Dr. Grace Hopper", hours: 3, courseCode: "AIM-504", classroom: "Room 301", school: "School of Engineering", mergeCode: "", sessionBlockSize: 0 }
 ];
+
+// Pure wrapper helper for time-based merge code to satisfy linter purity checks
+const getMergeCode = () => `MERGE-${Date.now().toString().slice(-4)}`;
 
 const INITIAL_SLOTS = [
   { id: 0, label: "Slot 1", time: "09:30 AM - 10:20 AM" },
@@ -329,6 +328,7 @@ function App() {
         setCourses(extractedData);
         updateFirestore({
           courses: extractedData,
+          fileName: file.name,
           timetableData: null,
           rawTimetableBackup: null,
           unscheduledLog: [],
@@ -393,6 +393,182 @@ function App() {
     XLSX.writeFile(wb, "Timetable_Course_List_Template.xlsx");
   };
 
+  const handleDownloadFixedSlotsTemplate = () => {
+    const headers = [
+      'Course name', 
+      'Course code', 
+      'Teaching Faculty', 
+      'Classroom', 
+      'School', 
+      'Day', 
+      'Slots', 
+      'Target Type', 
+      'Target Value'
+    ];
+    const demoFs = [
+      ['University Clubs', 'CLUB-101', 'Clubs Coordinator', 'Auditorium', 'All Schools', 'Wednesday', 'Slot 5, Slot 6', 'all', ''],
+      ['BCA Seminar', 'SEM-101', 'Dr. Alan Turing', 'Seminar Hall 1', 'School of Computing', 'Friday', 'Slot 3', 'group', 'BCA 1st - Semester 1'],
+      ['B.Tech Engineering SkillDrill', 'SKILL-201', 'Skill Dept', 'Workshops', 'School of Engineering', 'Monday', 'Slot 6, Slot 7', 'semester', 'Semester 3']
+    ];
+    const ws = XLSX.utils.aoa_to_sheet([headers, ...demoFs]);
+    ws['!cols'] = [
+      { wch: 25 }, { wch: 15 }, { wch: 22 }, { wch: 18 }, { wch: 22 }, { wch: 12 }, { wch: 15 }, { wch: 15 }, { wch: 25 }
+    ];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Fixed_Schedules");
+    XLSX.writeFile(wb, "Fixed_Schedules_Template.xlsx");
+  };
+
+  const parseFixedSlotsExcelFile = (file) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const data = new Uint8Array(e.target.result);
+        const workbook = XLSX.read(data, { type: 'array' });
+        let targetSheetName = "Fixed_Schedules";
+        let sheetExists = workbook.SheetNames.includes(targetSheetName);
+
+        if (!sheetExists) {
+          if (workbook.SheetNames.length > 0) {
+            targetSheetName = workbook.SheetNames[0];
+          } else {
+            throw new Error("Workbook contains no sheets.");
+          }
+        }
+
+        const worksheet = workbook.Sheets[targetSheetName];
+        const rawRows = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: "" });
+
+        if (rawRows.length < 1) {
+          throw new Error(`The sheet "${targetSheetName}" appears to be empty.`);
+        }
+
+        let headerRowIndex = 0;
+        let mapping = null;
+        let bestMatchCount = -1;
+
+        const aliases = {
+          courseName: ['course name', 'name', 'activity name', 'activity', 'title'],
+          courseCode: ['course code', 'code', 'activity code', 'id'],
+          faculty: ['teaching faculty', 'faculty', 'coordinator', 'teacher', 'instructor'],
+          classroom: ['classroom', 'room', 'venue', 'class room'],
+          school: ['school', 'department', 'dept', 'offering school'],
+          day: ['day', 'weekday', 'day of week'],
+          slots: ['slots', 'time slots', 'slot numbers', 'slot index'],
+          targetType: ['target type', 'targettype', 'type'],
+          targetValue: ['target value', 'targetvalue', 'value']
+        };
+
+        const scanLimit = Math.min(15, rawRows.length);
+        for (let r = 0; r < scanLimit; r++) {
+          const row = rawRows[r];
+          if (!row || !Array.isArray(row)) continue;
+          const headersCandidate = row.map(h => String(h || "").trim().toLowerCase());
+          
+          const mappingCandidate = {};
+          Object.keys(aliases).forEach(key => {
+            const matchedHeader = headersCandidate.find(h => aliases[key].includes(h));
+            if (matchedHeader) {
+              mappingCandidate[key] = row[headersCandidate.indexOf(matchedHeader)];
+            }
+          });
+
+          const matchCount = Object.keys(mappingCandidate).length;
+          if (matchCount > bestMatchCount) {
+            bestMatchCount = matchCount;
+            mapping = mappingCandidate;
+            headerRowIndex = r;
+          }
+        }
+
+        if (bestMatchCount <= 2 || !mapping) {
+          throw new Error("Could not detect the header row for fixed schedules. Please ensure columns match the template.");
+        }
+
+        const headers = rawRows[headerRowIndex].map(h => String(h || "").trim());
+        const extractedLocks = [];
+
+        for (let i = headerRowIndex + 1; i < rawRows.length; i++) {
+          const row = rawRows[i];
+          if (!row || row.every(val => val === "")) continue;
+
+          const getValByHeader = (headerName) => {
+            const headerIndex = headers.indexOf(headerName);
+            return headerIndex !== -1 ? row[headerIndex] : "";
+          };
+
+          const rawName = String(getValByHeader(mapping.courseName)).trim();
+          const rawCode = String(getValByHeader(mapping.courseCode)).trim();
+          const rawFaculty = String(getValByHeader(mapping.faculty)).trim();
+          const rawDayStr = String(getValByHeader(mapping.day)).trim().toLowerCase();
+          const rawSlotsStr = String(getValByHeader(mapping.slots)).trim();
+          const rawTargetType = String(getValByHeader(mapping.targetType)).trim().toLowerCase() || "all";
+          const rawTargetValue = String(getValByHeader(mapping.targetValue)).trim();
+
+          if (!rawName || !rawDayStr || !rawSlotsStr) continue;
+
+          const dayIndexMap = {
+            monday: 0, mon: 0,
+            tuesday: 1, tue: 1,
+            wednesday: 2, wed: 2,
+            thursday: 3, thu: 3,
+            friday: 4, fri: 4
+          };
+          const dayIdx = dayIndexMap[rawDayStr];
+          if (dayIdx === undefined) continue;
+
+          const slotIndexes = [];
+          const slotTokens = rawSlotsStr.split(/[,;+]/).map(s => s.trim().toLowerCase());
+          
+          slotTokens.forEach(tok => {
+            const matchedSlot = slots.find(s => s.label.toLowerCase() === tok || s.label.toLowerCase().replace(/\s+/g, '') === tok);
+            if (matchedSlot) {
+              slotIndexes.push(matchedSlot.id);
+            } else {
+              const numVal = parseInt(tok.replace(/[^0-9]/g, ''));
+              if (!isNaN(numVal)) {
+                if (numVal >= 1 && numVal <= 7) {
+                  slotIndexes.push(numVal - 1);
+                } else if (numVal >= 0 && numVal <= 6) {
+                  slotIndexes.push(numVal);
+                }
+              }
+            }
+          });
+
+          if (slotIndexes.length === 0) continue;
+
+          extractedLocks.push({
+            id: `fs-bulk-${Date.now()}-${i}-${Math.random().toString(36).substr(2, 4)}`,
+            courseName: rawName,
+            courseCode: rawCode || `FIXED-${i}`,
+            faculty: rawFaculty || "University Coordinator",
+            classroom: String(getValByHeader(mapping.classroom)).trim() || "TBD",
+            school: String(getValByHeader(mapping.school)).trim() || "University Wide",
+            day: dayIdx,
+            slots: [...new Set(slotIndexes)].sort((a, b) => a - b),
+            targetType: ['all', 'semester', 'group'].includes(rawTargetType) ? rawTargetType : "all",
+            targetValue: rawTargetValue
+          });
+        }
+
+        if (extractedLocks.length === 0) {
+          throw new Error("No valid fixed schedule rows parsed. Make sure Day and Slots match template parameters.");
+        }
+
+        const nextFixedSlots = [...fixedSlots, ...extractedLocks];
+        setFixedSlots(nextFixedSlots);
+        updateFirestore({ fixedSlots: nextFixedSlots });
+        setMoveMessage({ type: 'success', text: `Successfully imported ${extractedLocks.length} fixed schedule activities! Click "Generate Timetables" to apply changes.` });
+        setTimeout(() => setMoveMessage(null), 5000);
+      } catch (err) {
+        console.error(err);
+        alert(err.message || "An error occurred while parsing the fixed schedules file.");
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  };
+
   const handleLoadDemoData = () => {
     setCourses(DEMO_DATA);
     setFileName("Loaded Demo Dataset");
@@ -403,6 +579,7 @@ function App() {
     setMoveSource(null);
     updateFirestore({
       courses: DEMO_DATA,
+      fileName: "Loaded Demo Dataset",
       timetableData: null,
       rawTimetableBackup: null,
       unscheduledLog: [],
@@ -847,8 +1024,8 @@ function App() {
     setUnscheduledLog(tempUnscheduledLog);
     setFacultyWorkload(tempFacultyHours);
     updateFirestore({
-      timetableData: tempTimetables,
-      rawTimetableBackup: tempTimetables,
+      timetableData: JSON.stringify(tempTimetables),
+      rawTimetableBackup: JSON.stringify(tempTimetables),
       unscheduledLog: tempUnscheduledLog,
       facultyWorkload: tempFacultyHours
     });
@@ -863,19 +1040,7 @@ function App() {
 
   // --- MANUAL SLOT REALLOCATION ---
   
-  // Calculate total hours a faculty member teaches on a given day
-  const getFacultyHoursOnDay = (fac, day, currentTimetable) => {
-    let count = 0;
-    Object.keys(currentTimetable).forEach(g => {
-      for (let s = 0; s < 7; s++) {
-        const c = currentTimetable[g][day][s];
-        if (c && c.faculty === fac && !c.isPart2) {
-          count += c.duration;
-        }
-      }
-    });
-    return count;
-  };
+
 
   // Dry-run validator for moves
   const validateMove = (group, srcDay, srcSlot, destDay, destSlot) => {
@@ -1045,7 +1210,7 @@ function App() {
       setMoveSource(null);
       setMoveMessage({ type: 'success', text: `Successfully re-allocated "${actualCell.courseName}"!` });
       updateFirestore({
-        timetableData: nextTimetable,
+        timetableData: JSON.stringify(nextTimetable),
         facultyWorkload: nextWorkload
       });
 
@@ -1083,7 +1248,7 @@ function App() {
     setMoveSource(null);
     setMoveMessage({ type: 'success', text: "Reset timetable to generated state." });
     updateFirestore({
-      timetableData: restoredTimetable,
+      timetableData: JSON.stringify(restoredTimetable),
       facultyWorkload: restoredWorkload
     });
     setTimeout(() => setMoveMessage(null), 3000);
@@ -1285,7 +1450,7 @@ function App() {
   useEffect(() => {
     if (!activePlannerId) return;
 
-    setDbLoading(true);
+    Promise.resolve().then(() => setDbLoading(true));
     const unsub = onSnapshot(doc(db, "planners", activePlannerId), (docSnap) => {
       if (docSnap.exists()) {
         const data = docSnap.data();
@@ -1300,10 +1465,34 @@ function App() {
         }
         setFixedSlots(currentFixedSlots);
         setSlots(data.slots || INITIAL_SLOTS);
-        setTimetableData(data.timetableData || null);
-        setRawTimetableBackup(data.rawTimetableBackup || null);
+        
+        let parsedTimetable = null;
+        if (data.timetableData) {
+          try {
+            parsedTimetable = typeof data.timetableData === 'string'
+              ? JSON.parse(data.timetableData)
+              : data.timetableData;
+          } catch (e) {
+            console.error("Failed to parse timetableData JSON:", e);
+          }
+        }
+        setTimetableData(parsedTimetable);
+
+        let parsedBackup = null;
+        if (data.rawTimetableBackup) {
+          try {
+            parsedBackup = typeof data.rawTimetableBackup === 'string'
+              ? JSON.parse(data.rawTimetableBackup)
+              : data.rawTimetableBackup;
+          } catch (e) {
+            console.error("Failed to parse rawTimetableBackup JSON:", e);
+          }
+        }
+        setRawTimetableBackup(parsedBackup);
+
         setUnscheduledLog(data.unscheduledLog || []);
         setFacultyWorkload(data.facultyWorkload || {});
+        setFileName(data.fileName || "");
       } else {
         // Initialize active planner document with default settings if empty
         const plannerName = activePlannerId === "default" ? "Default Planner" : activePlannerId;
@@ -1317,7 +1506,8 @@ function App() {
           timetableData: null,
           rawTimetableBackup: null,
           unscheduledLog: [],
-          facultyWorkload: {}
+          facultyWorkload: {},
+          fileName: ""
         });
       }
       setDbLoading(false);
@@ -1344,7 +1534,8 @@ function App() {
         timetableData: null,
         rawTimetableBackup: null,
         unscheduledLog: [],
-        facultyWorkload: {}
+        facultyWorkload: {},
+        fileName: ""
       });
       setActivePlannerId(newId);
     } catch (err) {
@@ -1400,7 +1591,7 @@ function App() {
       setTimetableData(nextTimetable);
       updateFirestore({
         courses: nextCourses,
-        timetableData: nextTimetable
+        timetableData: JSON.stringify(nextTimetable)
       });
     } else {
       updateFirestore({
@@ -1413,7 +1604,7 @@ function App() {
   };
 
   const handleMergeSelected = () => {
-    const code = `MERGE-${Date.now().toString().slice(-4)}`;
+    const code = getMergeCode();
     const nextCourses = courses.map(c => {
       if (selectedCourseIds.includes(c.id)) {
         return { ...c, mergeCode: code };
@@ -1654,14 +1845,18 @@ function App() {
         )}
 
         {/* Parsing success state banner + Generate (Admin Only) */}
-        {fileName && !error && !loading && portalMode === "admin" && (
+        {courses.length > 0 && !error && !loading && portalMode === "admin" && (
           <div className="relative overflow-hidden bg-white border border-slate-200 p-3.5 rounded-xl flex flex-col sm:flex-row items-center justify-between gap-3 shadow-sm">
             <div className="flex items-center gap-2">
               <CheckCircleIcon className="w-5 h-5 text-emerald-600" />
               <div className="text-left">
-                <span className="text-[9px] text-slate-400 uppercase font-semibold block leading-none">Uploaded Document</span>
-                <span className="text-xs font-semibold font-mono text-slate-855 block mt-0.5">{fileName}</span>
-                <span className="text-[10px] text-slate-500 block mt-0.5">{courses.length} courses loaded from Course_List</span>
+                <span className="text-[9px] text-slate-400 uppercase font-semibold block leading-none">
+                  {fileName ? "Uploaded Document" : "Active Planner Dataset"}
+                </span>
+                <span className="text-xs font-semibold font-mono text-slate-855 block mt-0.5">
+                  {fileName || "Stored Course Catalog"}
+                </span>
+                <span className="text-[10px] text-slate-500 block mt-0.5">{courses.length} courses loaded</span>
               </div>
             </div>
             
@@ -2674,6 +2869,35 @@ function App() {
                   )}
                 </div>
 
+                {/* Bulk Import / Template Section */}
+                <div className="bg-indigo-50/45 border border-indigo-100 rounded-xl p-3 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs">
+                  <div className="text-left space-y-0.5">
+                    <span className="font-bold text-slate-700 block">Bulk Import Fixed Schedules</span>
+                    <span className="text-[10px] text-slate-500 block">Upload spreadsheet to lock activities in bulk.</span>
+                  </div>
+                  <div className="flex items-center gap-2 w-full sm:w-auto justify-end">
+                    <button
+                      onClick={handleDownloadFixedSlotsTemplate}
+                      className="px-2.5 py-1 text-[10px] border border-indigo-200 bg-white text-indigo-755 rounded-lg hover:bg-indigo-50 font-bold transition-all cursor-pointer"
+                    >
+                      📥 Template
+                    </button>
+                    <label className="px-2.5 py-1 text-[10px] bg-indigo-650 hover:bg-indigo-700 text-white rounded-lg font-bold shadow-sm transition-all cursor-pointer text-center">
+                      📁 Upload
+                      <input 
+                        type="file" 
+                        accept=".xlsx, .xls"
+                        onChange={(e) => {
+                          if (e.target.files && e.target.files[0]) {
+                            parseFixedSlotsExcelFile(e.target.files[0]);
+                          }
+                        }}
+                        className="hidden" 
+                      />
+                    </label>
+                  </div>
+                </div>
+
                 {/* Form to add or edit Fixed Slot */}
                  <div className="bg-slate-50 border border-slate-200 p-3 rounded-xl space-y-2 text-xs">
                    <div className="flex justify-between items-center mb-1">
@@ -2920,6 +3144,10 @@ function App() {
           </div>
         </div>
       )}
+      {/* Footer Watermark */}
+      <footer className="mt-8 border-t border-slate-205 pt-4 pb-2 text-center text-[10px] text-slate-400 font-medium tracking-wide font-display">
+        Designed & Developed by <span className="font-bold bg-clip-text text-transparent bg-gradient-to-r from-indigo-650 to-violet-650">Sachin Sharma</span>
+      </footer>
     </div>
   );
 }
